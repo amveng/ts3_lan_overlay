@@ -24,8 +24,6 @@ mod settings;
 pub const NAME: &str = "TS LAN Overlay";
 /// No packet for this long = the TS computer is gone; the overlays are emptied.
 const SILENCE: Duration = Duration::from_secs(3);
-/// How long a nick stays highlighted in "Список канала" after the person joins the channel.
-pub const JOIN_HIGHLIGHT: Duration = Duration::from_secs(15);
 
 pub struct Speaker {
     pub name: String,

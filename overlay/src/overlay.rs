@@ -406,12 +406,13 @@ unsafe fn paint(hwnd: HWND, i: usize) {
 
 /// Drops lingering speakers and join highlights whose time is up.
 fn expire() {
-    let linger = Duration::from_secs(UI.with_borrow(|ui| ui.as_ref().map_or(15, |u| u.cfg.int("linger").max(0) as u64)));
+    let secs = |key: &str| Duration::from_secs(UI.with_borrow(|ui| ui.as_ref().map_or(15, |u| u.cfg.int(key).max(0) as u64)));
+    let (linger, join) = (secs("linger"), secs("list_join_secs"));
     let changed = {
         let mut s = lock(&STATE);
         let before = (s.speakers.len(), s.joined.len());
         s.speakers.retain(|_, sp| sp.talking || sp.since.elapsed() < linger);
-        s.joined.retain(|_, t| t.elapsed() < crate::JOIN_HIGHLIGHT);
+        s.joined.retain(|_, t| t.elapsed() < join);
         (s.speakers.len(), s.joined.len()) != before
     };
     if changed {
