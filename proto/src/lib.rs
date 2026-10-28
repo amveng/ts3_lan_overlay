@@ -4,6 +4,7 @@
 //! ```text
 //! TSLANOVERLAY1
 //! me <self clid>
+//! ch <our channel id>
 //! c <clid> <nickname>                 one per client in our channel
 //! t <clid> <0|1 whisper> <nickname>   one per client talking right now
 //! ```
@@ -14,6 +15,7 @@ const MAGIC: &str = "TSLANOVERLAY1";
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Snapshot {
     pub self_id: u16,
+    pub channel_id: u64,
     /// Everyone in our channel: (clid, nickname). Empty = not connected to the server.
     pub channel: Vec<(u16, String)>,
     /// Who is talking right now: (clid, whisper, nickname).
@@ -31,7 +33,7 @@ fn field(s: &str) -> Option<(&str, &str)> {
 
 impl Snapshot {
     pub fn encode(&self) -> Vec<u8> {
-        let mut s = format!("{MAGIC}\nme {}\n", self.self_id);
+        let mut s = format!("{MAGIC}\nme {}\nch {}\n", self.self_id, self.channel_id);
         for (id, name) in &self.channel {
             s += &format!("c {id} {}\n", clean(name));
         }
@@ -50,13 +52,13 @@ impl Snapshot {
         for line in lines {
             let (kind, rest) = field(line)?;
             let (id, rest) = field(rest)?;
-            let id = id.parse().ok()?;
             match kind {
-                "me" => snap.self_id = id,
-                "c" => snap.channel.push((id, rest.to_string())),
+                "me" => snap.self_id = id.parse().ok()?,
+                "ch" => snap.channel_id = id.parse().ok()?,
+                "c" => snap.channel.push((id.parse().ok()?, rest.to_string())),
                 "t" => {
                     let (whisper, name) = field(rest)?;
-                    snap.talking.push((id, whisper == "1", name.to_string()));
+                    snap.talking.push((id.parse().ok()?, whisper == "1", name.to_string()));
                 }
                 _ => {}
             }
@@ -73,6 +75,7 @@ mod tests {
     fn round_trip() {
         let snap = Snapshot {
             self_id: 7,
+            channel_id: 4_000_000_123,
             channel: vec![(7, "Я сам".into()), (12, "ник с  пробелами".into())],
             talking: vec![(12, true, "ник с  пробелами".into()), (3, false, "Bob".into())],
         };

@@ -51,6 +51,7 @@ struct State {
     /// Host of the active tab, only to log server switches once.
     host: Option<String>,
     self_id: u16,
+    channel_id: u64,
     /// Everyone in our channel: (clid, nickname).
     channel: Vec<(u16, String)>,
     /// Talking right now: clid -> (whisper, nickname).
@@ -122,7 +123,7 @@ fn snapshot() -> Snapshot {
     let s = lock(&STATE);
     let mut talking: Vec<_> = s.talking.iter().map(|(&id, (w, n))| (id, *w, n.clone())).collect();
     talking.sort_by_key(|t| t.0);
-    Snapshot { self_id: s.self_id, channel: s.channel.clone(), talking }
+    Snapshot { self_id: s.self_id, channel_id: s.channel_id, channel: s.channel.clone(), talking }
 }
 
 fn run_sender(wake: mpsc::Receiver<()>) {
@@ -167,8 +168,8 @@ fn nickname(sch: u64, clid: u16) -> String {
     name
 }
 
-/// Our own clid and everyone in our channel, or None when not connected.
-fn read_channel(sch: u64) -> Option<(u16, Vec<(u16, String)>)> {
+/// Our own clid, our channel and everyone in it, or None when not connected.
+fn read_channel(sch: u64) -> Option<(u16, u64, Vec<(u16, String)>)> {
     let f = TS3.get()?;
     let (mut me, mut cid, mut list) = (0u16, 0u64, std::ptr::null_mut::<u16>());
     unsafe {
@@ -186,7 +187,7 @@ fn read_channel(sch: u64) -> Option<(u16, Vec<(u16, String)>)> {
             p = p.add(1);
         }
         (f.free_memory)(list.cast());
-        Some((me, ids.into_iter().map(|id| (id, nickname(sch, id))).collect()))
+        Some((me, cid, ids.into_iter().map(|id| (id, nickname(sch, id))).collect()))
     }
 }
 
@@ -205,7 +206,7 @@ fn refresh_channel() {
     let current = unsafe { (f.get_current_server_connection_handler_id)() };
     let host = server_host(current);
     let sch = if host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(SERVER)) { current } else { 0 };
-    let (me, channel) = if sch != 0 { read_channel(sch).unwrap_or_default() } else { Default::default() };
+    let (me, cid, channel) = if sch != 0 { read_channel(sch).unwrap_or_default() } else { Default::default() };
     {
         let mut s = lock(&STATE);
         if s.sch != sch {
@@ -217,7 +218,7 @@ fn refresh_channel() {
             }
             s.host = host;
         }
-        (s.sch, s.self_id, s.channel) = (sch, me, channel);
+        (s.sch, s.self_id, s.channel_id, s.channel) = (sch, me, cid, channel);
     }
     changed();
 }

@@ -24,6 +24,8 @@ mod settings;
 pub const NAME: &str = "TS LAN Overlay";
 /// No packet for this long = the TS computer is gone; the overlays are emptied.
 const SILENCE: Duration = Duration::from_secs(3);
+/// How long a nick stays highlighted in "Список канала" after the person joins the channel.
+pub const JOIN_HIGHLIGHT: Duration = Duration::from_secs(15);
 
 pub struct Speaker {
     pub name: String,
@@ -36,9 +38,12 @@ pub struct Speaker {
 #[derive(Default)]
 pub struct State {
     pub self_id: u16,
+    pub channel_id: u64,
     pub speakers: HashMap<u16, Speaker>,
     /// Everyone in the channel: (clid, nickname).
     pub channel: Vec<(u16, String)>,
+    /// When someone came into our channel, while they are highlighted.
+    pub joined: HashMap<u16, Instant>,
 }
 
 pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -79,7 +84,18 @@ fn apply(snap: &Snapshot) {
             }
         }
     }
+    // Only people arriving in the channel we already sit in; not everyone on connect or when
+    // we switch channels ourselves.
+    if !s.channel.is_empty() && s.channel_id == snap.channel_id {
+        for (id, _) in &snap.channel {
+            if !s.channel.iter().any(|c| c.0 == *id) {
+                s.joined.insert(*id, now);
+            }
+        }
+    }
+    s.joined.retain(|id, _| snap.channel.iter().any(|c| c.0 == *id));
     s.self_id = snap.self_id;
+    s.channel_id = snap.channel_id;
     s.channel = snap.channel.clone();
 }
 
@@ -134,4 +150,25 @@ fn main() {
     log(&format!("запущен, жду данные на порту UDP {PORT}"));
     std::thread::spawn(move || run_receiver(sock));
     overlay::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(channel_id: u64, ids: &[u16]) -> Snapshot {
+        Snapshot { self_id: 1, channel_id, channel: ids.iter().map(|&i| (i, format!("n{i}"))).collect(), talking: vec![] }
+    }
+
+    #[test]
+    fn highlights_only_people_joining_our_channel() {
+        apply(&snap(5, &[1, 2])); // connected: nobody highlighted
+        assert!(lock(&STATE).joined.is_empty());
+        apply(&snap(5, &[1, 2, 3])); // 3 came in
+        assert_eq!(lock(&STATE).joined.keys().copied().collect::<Vec<_>>(), vec![3]);
+        apply(&snap(5, &[1, 2])); // 3 left again
+        assert!(lock(&STATE).joined.is_empty());
+        apply(&snap(9, &[1, 7, 8])); // we moved to another channel
+        assert!(lock(&STATE).joined.is_empty());
+    }
 }

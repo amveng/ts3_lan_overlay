@@ -235,7 +235,8 @@ fn rows(i: usize, cfg: &Config, st: &State) -> Vec<Row> {
             .map(|(id, name)| {
                 let talking = st.speakers.get(id).is_some_and(|s| s.talking && !s.whisper);
                 let dot = if talking { cfg.color("color_talk") } else { blend(faded, bg, 0.35) };
-                Row::Item { text: name.clone(), dot, color: text }
+                let color = if st.joined.contains_key(id) { cfg.color("color_join") } else { text };
+                Row::Item { text: name.clone(), dot, color }
             })
             .collect();
     }
@@ -403,14 +404,15 @@ unsafe fn paint(hwnd: HWND, i: usize) {
     });
 }
 
-/// Drops lingering speakers whose time is up.
+/// Drops lingering speakers and join highlights whose time is up.
 fn expire() {
     let linger = Duration::from_secs(UI.with_borrow(|ui| ui.as_ref().map_or(15, |u| u.cfg.int("linger").max(0) as u64)));
     let changed = {
         let mut s = lock(&STATE);
-        let before = s.speakers.len();
+        let before = (s.speakers.len(), s.joined.len());
         s.speakers.retain(|_, sp| sp.talking || sp.since.elapsed() < linger);
-        s.speakers.len() != before
+        s.joined.retain(|_, t| t.elapsed() < crate::JOIN_HIGHLIGHT);
+        (s.speakers.len(), s.joined.len()) != before
     };
     if changed {
         layout_all();
