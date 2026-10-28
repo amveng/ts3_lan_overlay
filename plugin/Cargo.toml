@@ -1,0 +1,11 @@
+[package]
+name = "ts3_lan_overlay"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proto = { path = "../proto" }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
