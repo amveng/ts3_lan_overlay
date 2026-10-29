@@ -3,7 +3,8 @@
 //!
 //! A snapshot goes out right after every change and once a second anyway, as UDP broadcast on
 //! every local IPv4 address. Works on the active server tab, and only when it is connected to
-//! `SERVER`; otherwise it broadcasts an empty snapshot. Log in `ts3_lan_overlay.log` next to the DLL.
+//! `SERVER`; otherwise it broadcasts an empty snapshot. The overlay sends volume commands back
+//! to `CONTROL_PORT`. Log in `ts3_lan_overlay.log` next to the DLL.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
@@ -13,11 +14,12 @@ use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use proto::{PORT, Snapshot};
+use proto::{CONTROL_PORT, PORT, Snapshot};
 
 const NAME: &str = "ts3_lan_overlay";
 const STATUS_TALKING: c_int = 1;
@@ -25,6 +27,9 @@ const STATUS_DISCONNECTED: c_int = 0;
 const STATUS_CONNECTION_ESTABLISHED: c_int = 4;
 const LEAVE_VISIBILITY: c_int = 2;
 const CLIENT_NICKNAME: usize = 1;
+const CLIENT_VOLUME_MODIFICATOR: usize = 18;
+/// Range of the per-client volume the overlay may set, dB.
+const VOLUME_RANGE: (i32, i32) = (-40, 20);
 /// The plugin only works on this server; other tabs are ignored.
 const SERVER: &str = "irreale.cleanvoice.ru";
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -34,7 +39,9 @@ const RESCAN: Duration = Duration::from_secs(10);
 /// The few TS3Functions we call, by index in `struct TS3Functions` (ts3_functions.h, API 26).
 struct Ts3Fns {
     free_memory: unsafe extern "C" fn(*mut c_void) -> c_uint,
+    set_client_volume_modifier: unsafe extern "C" fn(u64, u16, f32) -> c_uint,
     get_client_id: unsafe extern "C" fn(u64, *mut u16) -> c_uint,
+    get_client_variable_as_int: unsafe extern "C" fn(u64, u16, usize, *mut c_int) -> c_uint,
     get_client_variable_as_string: unsafe extern "C" fn(u64, u16, usize, *mut *mut c_char) -> c_uint,
     get_channel_of_client: unsafe extern "C" fn(u64, u16, *mut u64) -> c_uint,
     get_channel_client_list: unsafe extern "C" fn(u64, u64, *mut *mut u16) -> c_uint,
@@ -54,14 +61,16 @@ struct State {
     channel_id: u64,
     /// Everyone in our channel: (clid, nickname).
     channel: Vec<(u16, String)>,
-    /// Talking right now: clid -> (whisper, nickname).
-    talking: HashMap<u16, (bool, String)>,
+    /// Talking right now: clid -> (whisper, our volume for them in dB, nickname).
+    talking: HashMap<u16, (bool, i32, String)>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
 static PLUGIN_DIR: LazyLock<PathBuf> = LazyLock::new(plugin_dir);
 /// Wakes the sender thread; dropping it stops the thread.
 static SENDER: Mutex<Option<(mpsc::Sender<()>, JoinHandle<()>)>> = Mutex::new(None);
+static CONTROL: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+static STOP_CONTROL: AtomicBool = AtomicBool::new(false);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -121,7 +130,7 @@ fn broadcast_sockets() -> Vec<(Ipv4Addr, UdpSocket)> {
 
 fn snapshot() -> Snapshot {
     let s = lock(&STATE);
-    let mut talking: Vec<_> = s.talking.iter().map(|(&id, (w, n))| (id, *w, n.clone())).collect();
+    let mut talking: Vec<_> = s.talking.iter().map(|(&id, (w, v, n))| (id, *w, *v, n.clone())).collect();
     talking.sort_by_key(|t| t.0);
     Snapshot { self_id: s.self_id, channel_id: s.channel_id, channel: s.channel.clone(), talking }
 }
@@ -148,6 +157,23 @@ fn run_sender(wake: mpsc::Receiver<()>) {
     }
 }
 
+/// Receives volume commands from the overlay until the plugin shuts down.
+fn run_control() {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CONTROL_PORT)) {
+        Ok(s) => s,
+        Err(e) => return log(&format!("не удалось открыть порт UDP {CONTROL_PORT}, громкость из оверлея не работает: {e}")),
+    };
+    let _ = sock.set_read_timeout(Some(HEARTBEAT));
+    let mut buf = [0u8; 512];
+    while !STOP_CONTROL.load(Ordering::Relaxed) {
+        if let Ok((n, _)) = sock.recv_from(&mut buf) {
+            if let Some((clid, db)) = proto::decode_volume(&buf[..n]) {
+                set_volume(clid, db);
+            }
+        }
+    }
+}
+
 /// Sends a fresh snapshot now. Safe to call from any thread.
 fn changed() {
     if let Some((tx, _)) = lock(&SENDER).as_ref() {
@@ -166,6 +192,33 @@ fn nickname(sch: u64, clid: u16) -> String {
     let name = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
     unsafe { (f.free_memory)(p.cast()) };
     name
+}
+
+fn volume(sch: u64, clid: u16) -> i32 {
+    let Some(f) = TS3.get() else { return 0 };
+    let mut v: c_int = 0;
+    if unsafe { (f.get_client_variable_as_int)(sch, clid, CLIENT_VOLUME_MODIFICATOR, &mut v) } != 0 {
+        return 0;
+    }
+    v
+}
+
+/// Sets our local volume for a client on the active tab, clamped to `VOLUME_RANGE`.
+fn set_volume(clid: u16, db: i32) {
+    let Some(f) = TS3.get() else { return };
+    let db = db.clamp(VOLUME_RANGE.0, VOLUME_RANGE.1);
+    let sch = lock(&STATE).sch;
+    if sch == 0 {
+        return;
+    }
+    let err = unsafe { (f.set_client_volume_modifier)(sch, clid, db as f32) };
+    if err != 0 {
+        return log(&format!("не удалось изменить громкость clid {clid}: ошибка {err}"));
+    }
+    if let Some(t) = lock(&STATE).talking.get_mut(&clid) {
+        t.1 = db;
+    }
+    changed();
 }
 
 /// Our own clid, our channel and everyone in it, or None when not connected.
@@ -232,7 +285,7 @@ pub extern "C" fn ts3plugin_name() -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_version() -> *const c_char {
-    c"0.1.0".as_ptr()
+    c"0.2.0".as_ptr()
 }
 
 #[unsafe(no_mangle)]
@@ -257,7 +310,9 @@ pub unsafe extern "C" fn ts3plugin_setFunctionPointers(funcs: *const *const c_vo
     unsafe {
         let _ = TS3.set(Ts3Fns {
             free_memory: std::mem::transmute(*funcs.add(5)),
+            set_client_volume_modifier: std::mem::transmute(*funcs.add(39)),
             get_client_id: std::mem::transmute(*funcs.add(73)),
+            get_client_variable_as_int: std::mem::transmute(*funcs.add(79)),
             get_client_variable_as_string: std::mem::transmute(*funcs.add(81)),
             get_channel_of_client: std::mem::transmute(*funcs.add(83)),
             get_channel_client_list: std::mem::transmute(*funcs.add(94)),
@@ -272,6 +327,8 @@ pub extern "C" fn ts3plugin_init() -> c_int {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || run_sender(rx));
     *lock(&SENDER) = Some((tx, handle));
+    STOP_CONTROL.store(false, Ordering::Relaxed);
+    *lock(&CONTROL) = Some(std::thread::spawn(run_control));
     refresh_channel();
     0
 }
@@ -283,6 +340,10 @@ pub extern "C" fn ts3plugin_shutdown() {
     changed();
     if let Some((tx, handle)) = lock(&SENDER).take() {
         drop(tx);
+        let _ = handle.join();
+    }
+    STOP_CONTROL.store(true, Ordering::Relaxed);
+    if let Some(handle) = lock(&CONTROL).take() {
         let _ = handle.join();
     }
 }
@@ -304,14 +365,14 @@ pub extern "C" fn ts3plugin_onConnectStatusChangeEvent(_sch: u64, new_status: c_
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_onTalkStatusChangeEvent(sch: u64, status: c_int, is_received_whisper: c_int, client_id: u16) {
     let talking = status == STATUS_TALKING;
-    let name = if talking { nickname(sch, client_id) } else { String::new() };
+    let (name, vol) = if talking { (nickname(sch, client_id), volume(sch, client_id)) } else { (String::new(), 0) };
     {
         let mut s = lock(&STATE);
         if s.sch != sch {
             return;
         }
         if talking {
-            s.talking.insert(client_id, (is_received_whisper != 0, name));
+            s.talking.insert(client_id, (is_received_whisper != 0, vol, name));
         } else {
             s.talking.remove(&client_id);
         }
@@ -378,7 +439,7 @@ pub extern "C" fn ts3plugin_onClientDisplayNameChanged(sch: u64, client_id: u16,
             return;
         }
         if let Some(t) = s.talking.get_mut(&client_id) {
-            t.1 = name.clone();
+            t.2 = name.clone();
         }
         if let Some(c) = s.channel.iter_mut().find(|(id, _)| *id == client_id) {
             c.1 = name;

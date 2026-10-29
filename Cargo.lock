@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "proto"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ts3_lan_overlay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proto",
  "windows-sys",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "ts_lan_overlay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proto",
  "windows-sys",

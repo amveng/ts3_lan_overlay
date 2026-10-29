@@ -10,12 +10,12 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use proto::{PORT, Snapshot};
+use proto::{CONTROL_PORT, PORT, Snapshot};
 
 mod config;
 mod overlay;
@@ -24,6 +24,8 @@ mod settings;
 pub const NAME: &str = "TS LAN Overlay";
 /// No packet for this long = the TS computer is gone; the overlays are emptied.
 const SILENCE: Duration = Duration::from_secs(3);
+/// Range of the per-client volume the overlay lets you set, dB (the plugin clamps too).
+const VOLUME_RANGE: (i32, i32) = (-40, 20);
 
 pub struct Speaker {
     pub name: String,
@@ -31,6 +33,8 @@ pub struct Speaker {
     pub whisper: bool,
     /// When they started talking, or when they stopped if `talking` is false.
     pub since: Instant,
+    /// The TS computer's local volume adjustment for them, dB.
+    pub volume: i32,
 }
 
 #[derive(Default)]
@@ -45,6 +49,8 @@ pub struct State {
 }
 
 pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
+/// Where the last snapshot came from; volume commands go back there.
+static TS_ADDR: Mutex<Option<IpAddr>> = Mutex::new(None);
 pub static DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     let dir = PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join(NAME);
     let _ = std::fs::create_dir_all(&dir);
@@ -74,11 +80,12 @@ fn apply(snap: &Snapshot) {
             sp.since = now; // starts the linger countdown
         }
     }
-    for (id, whisper, name) in &snap.talking {
+    for (id, whisper, volume, name) in &snap.talking {
         match s.speakers.get_mut(id) {
-            Some(sp) if sp.talking && sp.whisper == *whisper => sp.name = name.clone(),
+            Some(sp) if sp.talking && sp.whisper == *whisper => (sp.name, sp.volume) = (name.clone(), *volume),
             _ => {
-                s.speakers.insert(*id, Speaker { name: name.clone(), talking: true, whisper: *whisper, since: now });
+                let speaker = Speaker { name: name.clone(), talking: true, whisper: *whisper, since: now, volume: *volume };
+                s.speakers.insert(*id, speaker);
             }
         }
     }
@@ -97,6 +104,21 @@ fn apply(snap: &Snapshot) {
     s.channel = snap.channel.clone();
 }
 
+/// Asks the TS computer to set its volume for a client; shown here right away.
+/// Called from the overlay thread.
+pub fn set_volume(clid: u16, db: i32) {
+    let db = db.clamp(VOLUME_RANGE.0, VOLUME_RANGE.1);
+    let Some(ip) = *lock(&TS_ADDR) else { return };
+    let sent = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|s| s.send_to(&proto::encode_volume(clid, db), (ip, CONTROL_PORT)));
+    if let Err(e) = sent {
+        return log(&format!("не удалось отправить громкость на {ip}: {e}"));
+    }
+    if let Some(sp) = lock(&STATE).speakers.get_mut(&clid) {
+        sp.volume = db;
+    }
+    overlay::refresh();
+}
+
 fn run_receiver(sock: UdpSocket) {
     let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
     let mut buf = vec![0u8; 65536];
@@ -108,6 +130,7 @@ fn run_receiver(sock: UdpSocket) {
             Ok((n, from)) => match Snapshot::decode(&buf[..n]) {
                 Some(snap) => {
                     heard = Instant::now();
+                    *lock(&TS_ADDR) = Some(from.ip());
                     // a TS computer on several networks sends from each address; log the first
                     if !connected {
                         log(&format!("получаю данные от {}", from.ip()));

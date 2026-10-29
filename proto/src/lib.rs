@@ -1,16 +1,22 @@
-//! The UDP packet the TS plugin broadcasts on the local network and the overlay listens for.
+//! UDP packets between the TS plugin and the overlay on the local network.
 //!
-//! Plain UTF-8 lines; the nickname is always the last field, so it may contain spaces:
+//! The plugin broadcasts a snapshot to `PORT`; the overlay sends volume commands back to the
+//! plugin's `CONTROL_PORT`. Plain UTF-8 lines; the nickname is always the last field, so it may
+//! contain spaces:
 //! ```text
-//! TSLANOVERLAY1
+//! TSLANOVERLAY2
 //! me <self clid>
 //! ch <our channel id>
-//! c <clid> <nickname>                 one per client in our channel
-//! t <clid> <0|1 whisper> <nickname>   one per client talking right now
+//! c <clid> <nickname>                         one per client in our channel
+//! t <clid> <0|1 whisper> <volume dB> <nickname>   one per client talking right now
+//! vol <clid> <volume dB>                      a command, alone in its packet
 //! ```
+//! The version in the magic line changes whenever the format does, so a plugin and an overlay
+//! of different versions ignore each other instead of misreading.
 
 pub const PORT: u16 = 39391;
-const MAGIC: &str = "TSLANOVERLAY1";
+pub const CONTROL_PORT: u16 = 39392;
+const MAGIC: &str = "TSLANOVERLAY2";
 
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Snapshot {
@@ -18,8 +24,8 @@ pub struct Snapshot {
     pub channel_id: u64,
     /// Everyone in our channel: (clid, nickname). Empty = not connected to the server.
     pub channel: Vec<(u16, String)>,
-    /// Who is talking right now: (clid, whisper, nickname).
-    pub talking: Vec<(u16, bool, String)>,
+    /// Who is talking right now: (clid, whisper, our volume for them in dB, nickname).
+    pub talking: Vec<(u16, bool, i32, String)>,
 }
 
 fn clean(name: &str) -> String {
@@ -37,8 +43,8 @@ impl Snapshot {
         for (id, name) in &self.channel {
             s += &format!("c {id} {}\n", clean(name));
         }
-        for (id, whisper, name) in &self.talking {
-            s += &format!("t {id} {} {}\n", *whisper as u8, clean(name));
+        for (id, whisper, volume, name) in &self.talking {
+            s += &format!("t {id} {} {volume} {}\n", *whisper as u8, clean(name));
         }
         s.into_bytes()
     }
@@ -57,14 +63,31 @@ impl Snapshot {
                 "ch" => snap.channel_id = id.parse().ok()?,
                 "c" => snap.channel.push((id.parse().ok()?, rest.to_string())),
                 "t" => {
-                    let (whisper, name) = field(rest)?;
-                    snap.talking.push((id.parse().ok()?, whisper == "1", name.to_string()));
+                    let (whisper, rest) = field(rest)?;
+                    let (volume, name) = field(rest)?;
+                    snap.talking.push((id.parse().ok()?, whisper == "1", volume.parse().ok()?, name.to_string()));
                 }
                 _ => {}
             }
         }
         Some(snap)
     }
+}
+
+/// "Set our volume for this client to `db`".
+pub fn encode_volume(clid: u16, db: i32) -> Vec<u8> {
+    format!("{MAGIC}\nvol {clid} {db}\n").into_bytes()
+}
+
+pub fn decode_volume(buf: &[u8]) -> Option<(u16, i32)> {
+    let mut lines = std::str::from_utf8(buf).ok()?.lines();
+    if lines.next()? != MAGIC {
+        return None;
+    }
+    let (kind, rest) = field(lines.next()?)?;
+    let (id, db) = field(rest)?;
+    (kind == "vol").then_some(())?;
+    Some((id.parse().ok()?, db.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -77,10 +100,18 @@ mod tests {
             self_id: 7,
             channel_id: 4_000_000_123,
             channel: vec![(7, "Я сам".into()), (12, "ник с  пробелами".into())],
-            talking: vec![(12, true, "ник с  пробелами".into()), (3, false, "Bob".into())],
+            talking: vec![(12, true, -6, "ник с  пробелами".into()), (3, false, 0, "Bob".into())],
         };
         assert_eq!(Snapshot::decode(&snap.encode()), Some(snap));
         assert_eq!(Snapshot::decode(&Snapshot::default().encode()), Some(Snapshot::default()));
         assert_eq!(Snapshot::decode(b"garbage"), None);
+        assert_eq!(Snapshot::decode(b"TSLANOVERLAY1\nme 1\n"), None);
+    }
+
+    #[test]
+    fn volume_command() {
+        assert_eq!(decode_volume(&encode_volume(12, -15)), Some((12, -15)));
+        assert_eq!(decode_volume(&Snapshot::default().encode()), None);
+        assert_eq!(decode_volume(b"garbage"), None);
     }
 }

@@ -1,7 +1,7 @@
 ﻿; Installer for the TS3 plugin (the computer with TeamSpeak). Build with installer\build.ps1.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 
 [Setup]
@@ -93,5 +93,11 @@ begin
 end;
 
 [Run]
+; Volume commands from the overlay arrive unsolicited on UDP 39392; only from the local network.
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""TS LAN Overlay (плагин)"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""TS LAN Overlay (плагин)"" dir=in action=allow protocol=UDP localport=39392 remoteip=localsubnet profile=any"; Flags: runhidden
 Filename: "{app}\ts3_lan_overlay — инструкция.txt"; Description: "Открыть инструкцию"; Flags: postinstall shellexec skipifsilent
 Filename: "{app}"; Description: "Открыть папку плагинов"; Flags: postinstall shellexec skipifsilent unchecked
+
+[UninstallRun]
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""TS LAN Overlay (плагин)"""; Flags: runhidden; RunOnceId: "DelFirewallRule"
