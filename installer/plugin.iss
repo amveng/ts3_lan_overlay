@@ -1,7 +1,7 @@
 ﻿; Installer for the TS3 plugin (the computer with TeamSpeak). Build with installer\build.ps1.
 
 #ifndef AppVersion
-  #define AppVersion "0.2.0"
+  #define AppVersion "0.3.1"
 #endif
 
 [Setup]
@@ -39,6 +39,7 @@ Source: "..\Инструкция по установке.txt"; DestDir: "{app}";
 
 [UninstallDelete]
 Type: files; Name: "{app}\ts3_lan_overlay.log"
+Type: files; Name: "{app}\ts3_lan_overlay_volumes.txt"
 
 [Code]
 const
