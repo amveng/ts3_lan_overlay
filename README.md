@@ -11,6 +11,7 @@ A "who is talking" overlay for when TeamSpeak 3 runs on one computer and the gam
   - **"Кто говорит" (Talking)**: whispers on top (orange dot), channel voice below (green dot);
   - **"Список канала" (Channel list)**: everyone in the channel. Someone who has just joined is highlighted in blue.
 - **Per-person volume** is changed with the mouse wheel right in the Talking window on the gaming computer. The command goes to TeamSpeak on the other computer.
+- **Several server tabs:** when TeamSpeak is connected to more than one server, both windows show every tab under a heading with the server address (as on the TeamSpeak tab), the active tab first. Channel voice from the other tabs gets its own dot colour (purple by default, set in the settings).
 
 The computers find each other automatically, no IP addresses to enter. The windows do not get in the way of the game: clicks pass through them and they never take focus. The game must run in borderless windowed mode.
 
@@ -26,6 +27,8 @@ Download both installers of the same version from [Releases](https://github.com/
 |---|---|
 | with TeamSpeak | `ts_lan_overlay_plugin_setup_X.Y.Z.exe`, then enable "TS LAN Overlay" in TeamSpeak → Options → Addons |
 | gaming | `ts_lan_overlay_setup_X.Y.Z.exe`; the program starts by itself, starting with Windows is a checkbox in the installer |
+
+The plugin and the program must be the **same version**: different versions ignore each other.
 
 The installers open the needed ports in Windows Firewall.
 
@@ -96,6 +99,7 @@ The plugin sends data only inside the local network, and only to the TS LAN Over
   - **«Кто говорит»**: шёпот наверху (оранжевая точка), ниже голос в канале (зелёная точка);
   - **«Список канала»**: все, кто в канале. Ник того, кто только что зашёл, подсвечивается голубым.
 - **Громкость отдельного человека** меняется колесом мыши прямо из окна «Кто говорит» на игровом компьютере. Команда уходит в TeamSpeak на второй компьютер.
+- **Несколько вкладок:** если TeamSpeak подключён к нескольким серверам, оба окна показывают все вкладки, у каждой заголовок с адресом сервера (как на вкладке TeamSpeak); активная вкладка сверху. Голос в канале на других вкладках отмечается своим цветом точки (по умолчанию фиолетовым, меняется в настройках).
 
 Компьютеры находят друг друга сами, IP-адреса вписывать не нужно. Окна не мешают игре: клики проходят сквозь них, фокус они не забирают. Игра должна быть в режиме «Оконный без рамки» (Borderless).
 

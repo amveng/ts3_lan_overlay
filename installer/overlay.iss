@@ -1,7 +1,7 @@
 ﻿; Installer for the overlay program (the gaming computer). Build with installer\build.ps1.
 
 #ifndef AppVersion
-  #define AppVersion "0.3.1"
+  #define AppVersion "0.3.2"
 #endif
 #define Exe "ts_lan_overlay.exe"
 

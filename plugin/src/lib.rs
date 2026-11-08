@@ -2,11 +2,11 @@
 //! for the TS LAN Overlay program on another computer to draw.
 //!
 //! A snapshot goes out right after every change and once a second anyway, as UDP broadcast on
-//! every local IPv4 address. Works on the active server tab; when it is not connected it
-//! broadcasts an empty snapshot. The overlay sends volume commands back
+//! every local IPv4 address. Covers every connected server tab; with none it broadcasts an
+//! empty snapshot. The overlay sends volume commands back
 //! to `CONTROL_PORT`. Log in `ts3_lan_overlay.log` next to the DLL.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -46,22 +46,32 @@ struct Ts3Fns {
     get_channel_client_list: unsafe extern "C" fn(u64, u64, *mut *mut u16) -> c_uint,
     get_current_server_connection_handler_id: unsafe extern "C" fn() -> u64,
     get_server_connect_info: unsafe extern "C" fn(u64, *mut c_char, *mut u16, *mut c_char, usize) -> c_uint,
+    get_server_connection_handler_list: unsafe extern "C" fn(*mut *mut u64) -> c_uint,
 }
 
 static TS3: OnceLock<Ts3Fns> = OnceLock::new();
 
+/// One connected server tab.
 #[derive(Default)]
-struct State {
-    /// Active server tab; events from other tabs are ignored.
-    sch: u64,
-    /// Host of the active tab, only to log server switches once.
-    host: Option<String>,
+struct Tab {
+    /// Server address as TS shows it on the tab, for the tab's heading in the overlays.
+    name: String,
+    /// The address last logged for this tab.
+    host: String,
     self_id: u16,
     channel_id: u64,
     /// Everyone in our channel: (clid, nickname).
     channel: Vec<(u16, String)>,
     /// Talking right now: clid -> (whisper, our volume for them in dB, nickname).
     talking: HashMap<u16, (bool, i32, String)>,
+}
+
+#[derive(Default)]
+struct State {
+    /// The tab in front in TS.
+    active: u64,
+    /// Every connected tab by server connection handler id.
+    tabs: BTreeMap<u64, Tab>,
 }
 
 /// Volumes set from the overlay. TS neither remembers setClientVolumeModifier across
@@ -71,9 +81,9 @@ struct Volumes {
     /// uid -> (our dB, TS's own value when we set it). If TS's value later differs, the
     /// volume was changed in TS's own window and that wins.
     saved: HashMap<String, (i32, i32)>,
-    /// Live clids we set or re-applied a volume for -> what TS reported right after; a
+    /// Live (tab, clid) we set or re-applied a volume for -> what TS reported right after; a
     /// rejoin gets a new clid.
-    echo: HashMap<u16, i32>,
+    echo: HashMap<(u64, u16), i32>,
 }
 
 static VOLUMES: LazyLock<Mutex<Volumes>> =
@@ -144,9 +154,24 @@ fn broadcast_sockets() -> Vec<(Ipv4Addr, UdpSocket)> {
 
 fn snapshot() -> Snapshot {
     let s = lock(&STATE);
-    let mut talking: Vec<_> = s.talking.iter().map(|(&id, (w, v, n))| (id, *w, *v, n.clone())).collect();
-    talking.sort_by_key(|t| t.0);
-    Snapshot { self_id: s.self_id, channel_id: s.channel_id, channel: s.channel.clone(), talking }
+    let tabs = s
+        .tabs
+        .iter()
+        .map(|(&id, t)| {
+            let mut talking: Vec<_> = t.talking.iter().map(|(&id, (w, v, n))| (id, *w, *v, n.clone())).collect();
+            talking.sort_by_key(|t| t.0);
+            proto::Tab {
+                id,
+                active: id == s.active,
+                name: t.name.clone(),
+                self_id: t.self_id,
+                channel_id: t.channel_id,
+                channel: t.channel.clone(),
+                talking,
+            }
+        })
+        .collect();
+    Snapshot { tabs }
 }
 
 fn run_sender(wake: mpsc::Receiver<()>) {
@@ -181,8 +206,8 @@ fn run_control() {
     let mut buf = [0u8; 512];
     while !STOP_CONTROL.load(Ordering::Relaxed) {
         if let Ok((n, _)) = sock.recv_from(&mut buf) {
-            if let Some((clid, db)) = proto::decode_volume(&buf[..n]) {
-                set_volume(clid, db);
+            if let Some((tab, clid, db)) = proto::decode_volume(&buf[..n]) {
+                set_volume(tab, clid, db);
             }
         }
     }
@@ -257,42 +282,36 @@ fn set_modifier(sch: u64, clid: u16, db: i32) -> bool {
 }
 
 /// Our volume for a client: the one saved from the overlay, unless it was changed in TS since.
-/// The first time a clid is seen, the saved volume is applied to TS (it forgets it on rejoin).
+/// It is set in TS again on every look: TS drops a plugin-set volume on a rejoin, and also on
+/// its own while the person stays, going back to its remembered value.
 fn volume(sch: u64, clid: u16) -> i32 {
     let v = ts_volume(sch, clid);
     let Some(uid) = client_string(sch, clid, CLIENT_UNIQUE_IDENTIFIER) else { return v };
     let mut vols = lock(&VOLUMES);
     let Some(&(ours, base)) = vols.saved.get(&uid) else { return v };
-    // A live clid must still show what TS reported right after our own change; a new clid
-    // (rejoin, TS restart) must show TS's own remembered value from before our change.
-    let (expected, first) = match vols.echo.get(&clid) {
-        Some(&e) => (e, false),
-        None => (base, true),
-    };
-    if v != expected {
-        log(&format!("громкость {uid} изменена в TeamSpeak: {v} дБ (ждал {expected}), значение из оверлея {ours} дБ забыто"));
+    // TS shows either what it reported right after our own change, or its own remembered value
+    // from before it (a new clid, or TS dropped ours). Anything else was set in TS's window.
+    let echo = vols.echo.get(&(sch, clid)).copied();
+    if v != echo.unwrap_or(base) && v != base {
+        log(&format!("громкость {uid} изменена в TeamSpeak: {v} дБ, значение из оверлея {ours} дБ забыто"));
         vols.saved.remove(&uid);
-        vols.echo.remove(&clid);
+        vols.echo.remove(&(sch, clid));
         save_volumes(&vols.saved);
         return v;
     }
-    if first {
-        drop(vols);
-        set_modifier(sch, clid, ours);
-        let echo = ts_volume(sch, clid);
-        log(&format!("громкость {uid}: восстановлена {ours} дБ (в TS было {v}, стало {echo})"));
-        lock(&VOLUMES).echo.insert(clid, echo);
+    drop(vols);
+    set_modifier(sch, clid, ours);
+    let now = ts_volume(sch, clid);
+    if echo != Some(v) {
+        log(&format!("громкость {uid}: восстановлена {ours} дБ (в TS было {v}, стало {now})"));
     }
+    lock(&VOLUMES).echo.insert((sch, clid), now);
     ours
 }
 
-/// Sets and saves our local volume for a client on the active tab, clamped to `VOLUME_RANGE`.
-fn set_volume(clid: u16, db: i32) {
+/// Sets and saves our local volume for a client on tab `sch`, clamped to `VOLUME_RANGE`.
+fn set_volume(sch: u64, clid: u16, db: i32) {
     let db = db.clamp(VOLUME_RANGE.0, VOLUME_RANGE.1);
-    let sch = lock(&STATE).sch;
-    if sch == 0 {
-        return;
-    }
     let Some(uid) = client_string(sch, clid, CLIENT_UNIQUE_IDENTIFIER) else {
         return log(&format!("не удалось узнать уникальный ID clid {clid}, громкость не изменена"));
     };
@@ -301,7 +320,7 @@ fn set_volume(clid: u16, db: i32) {
     // what our previous change left there.
     let base = {
         let vols = lock(&VOLUMES);
-        match (vols.saved.get(&uid), vols.echo.get(&clid)) {
+        match (vols.saved.get(&uid), vols.echo.get(&(sch, clid))) {
             (Some(&(_, b)), Some(&e)) if v == e => b,
             _ => v,
         }
@@ -313,10 +332,10 @@ fn set_volume(clid: u16, db: i32) {
     {
         let mut vols = lock(&VOLUMES);
         vols.saved.insert(uid, (db, base));
-        vols.echo.insert(clid, echo);
+        vols.echo.insert((sch, clid), echo);
         save_volumes(&vols.saved);
     }
-    if let Some(t) = lock(&STATE).talking.get_mut(&clid) {
+    if let Some(t) = lock(&STATE).tabs.get_mut(&sch).and_then(|t| t.talking.get_mut(&clid)) {
         t.1 = db;
     }
     changed();
@@ -353,33 +372,65 @@ fn server_host(sch: u64) -> Option<String> {
     (err == 0).then(|| unsafe { CStr::from_ptr(host.as_ptr()) }.to_string_lossy().trim().to_string())
 }
 
-/// Re-reads the channel membership of the active tab. TS calls are made before taking the lock.
-/// A tab that is not connected counts as no tab (sch 0), so nothing is shown.
-fn refresh_channel() {
-    let Some(f) = TS3.get() else { return };
-    let current = unsafe { (f.get_current_server_connection_handler_id)() };
-    let host = server_host(current);
-    let sch = if host.is_some() { current } else { 0 };
-    let (me, cid, channel) = if sch != 0 { read_channel(sch).unwrap_or_default() } else { Default::default() };
-    if lock(&STATE).sch != sch {
-        lock(&VOLUMES).echo.clear();
+/// All server tabs TS has open, connected or not.
+fn tab_ids() -> Vec<u64> {
+    let Some(f) = TS3.get() else { return Vec::new() };
+    let mut list = std::ptr::null_mut::<u64>();
+    if unsafe { (f.get_server_connection_handler_list)(&mut list) } != 0 || list.is_null() {
+        return Vec::new();
     }
+    let mut ids = Vec::new();
+    unsafe {
+        let mut p = list;
+        while *p != 0 {
+            ids.push(*p);
+            p = p.add(1);
+        }
+        (f.free_memory)(list.cast());
+    }
+    ids
+}
+
+/// Re-reads every tab: which are connected, and each one's channel.
+fn refresh_all() {
+    let Some(f) = TS3.get() else { return };
+    let ids = tab_ids();
+    let active = unsafe { (f.get_current_server_connection_handler_id)() };
+    {
+        let mut s = lock(&STATE);
+        s.active = active;
+        s.tabs.retain(|sch, _| ids.contains(sch));
+    }
+    lock(&VOLUMES).echo.retain(|(sch, _), _| ids.contains(sch));
+    for sch in ids {
+        refresh_tab(sch);
+    }
+    changed();
+}
+
+/// Re-reads one tab's channel membership; a tab that is not connected is dropped. TS calls are
+/// made before taking the lock.
+fn refresh_tab(sch: u64) {
+    let Some(host) = server_host(sch) else {
+        if lock(&STATE).tabs.remove(&sch).is_some() {
+            lock(&VOLUMES).echo.retain(|(s, _), _| *s != sch);
+            changed();
+        }
+        return;
+    };
+    let Some((me, cid, channel)) = read_channel(sch) else { return };
     // apply saved volumes as people show up in our channel, before they start talking
     for (id, _) in &channel {
         volume(sch, *id);
     }
     {
         let mut s = lock(&STATE);
-        if s.sch != sch {
-            s.talking.clear();
+        let t = s.tabs.entry(sch).or_default();
+        if t.host != host {
+            log(&format!("вкладка {sch}: сервер {host}"));
+            t.host = host.clone();
         }
-        if s.host != host {
-            if let Some(h) = &host {
-                log(&format!("вкладка {current}: сервер {h}"));
-            }
-            s.host = host;
-        }
-        (s.sch, s.self_id, s.channel_id, s.channel) = (sch, me, cid, channel);
+        (t.name, t.self_id, t.channel_id, t.channel) = (host, me, cid, channel);
     }
     changed();
 }
@@ -393,7 +444,7 @@ pub extern "C" fn ts3plugin_name() -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_version() -> *const c_char {
-    c"0.3.1".as_ptr()
+    c"0.3.2".as_ptr()
 }
 
 #[unsafe(no_mangle)]
@@ -426,6 +477,7 @@ pub unsafe extern "C" fn ts3plugin_setFunctionPointers(funcs: *const *const c_vo
             get_channel_client_list: std::mem::transmute(*funcs.add(94)),
             get_current_server_connection_handler_id: std::mem::transmute(*funcs.add(183)),
             get_server_connect_info: std::mem::transmute(*funcs.add(189)),
+            get_server_connection_handler_list: std::mem::transmute(*funcs.add(96)),
         });
     }
 }
@@ -437,7 +489,7 @@ pub extern "C" fn ts3plugin_init() -> c_int {
     *lock(&SENDER) = Some((tx, handle));
     STOP_CONTROL.store(false, Ordering::Relaxed);
     *lock(&CONTROL) = Some(std::thread::spawn(run_control));
-    refresh_channel();
+    refresh_all();
     0
 }
 
@@ -460,13 +512,13 @@ pub extern "C" fn ts3plugin_shutdown() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_currentServerConnectionChanged(_sch: u64) {
-    refresh_channel();
+    refresh_all();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_onConnectStatusChangeEvent(_sch: u64, new_status: c_int, _error: c_uint) {
     if new_status == STATUS_CONNECTION_ESTABLISHED || new_status == STATUS_DISCONNECTED {
-        refresh_channel();
+        refresh_all();
     }
 }
 
@@ -476,30 +528,24 @@ pub extern "C" fn ts3plugin_onTalkStatusChangeEvent(sch: u64, status: c_int, is_
     let (name, vol) = if talking { (nickname(sch, client_id), volume(sch, client_id)) } else { (String::new(), 0) };
     {
         let mut s = lock(&STATE);
-        if s.sch != sch {
-            return;
-        }
+        let Some(t) = s.tabs.get_mut(&sch) else { return };
         if talking {
-            s.talking.insert(client_id, (is_received_whisper != 0, vol, name));
+            t.talking.insert(client_id, (is_received_whisper != 0, vol, name));
         } else {
-            s.talking.remove(&client_id);
+            t.talking.remove(&client_id);
         }
     }
     changed();
 }
 
 fn on_move(sch: u64, client_id: u16, visibility: c_int) {
-    {
-        let mut s = lock(&STATE);
-        if s.sch != sch {
-            return;
+    if visibility == LEAVE_VISIBILITY {
+        if let Some(t) = lock(&STATE).tabs.get_mut(&sch) {
+            t.talking.remove(&client_id); // clids get recycled
         }
-        if visibility == LEAVE_VISIBILITY {
-            s.talking.remove(&client_id); // clids get recycled
-            lock(&VOLUMES).echo.remove(&client_id);
-        }
+        lock(&VOLUMES).echo.remove(&(sch, client_id));
     }
-    refresh_channel();
+    refresh_tab(sch);
 }
 
 #[unsafe(no_mangle)]
@@ -544,13 +590,11 @@ pub extern "C" fn ts3plugin_onClientDisplayNameChanged(sch: u64, client_id: u16,
     let name = unsafe { CStr::from_ptr(display_name) }.to_string_lossy().into_owned();
     {
         let mut s = lock(&STATE);
-        if s.sch != sch {
-            return;
-        }
-        if let Some(t) = s.talking.get_mut(&client_id) {
+        let Some(tab) = s.tabs.get_mut(&sch) else { return };
+        if let Some(t) = tab.talking.get_mut(&client_id) {
             t.2 = name.clone();
         }
-        if let Some(c) = s.channel.iter_mut().find(|(id, _)| *id == client_id) {
+        if let Some(c) = tab.channel.iter_mut().find(|(id, _)| *id == client_id) {
             c.1 = name;
         }
     }
@@ -609,6 +653,9 @@ mod tests {
     unsafe extern "C" fn fail_info(_: u64, _: *mut c_char, _: *mut u16, _: *mut c_char, _: usize) -> c_uint {
         1
     }
+    unsafe extern "C" fn fail_tabs(_: *mut *mut u64) -> c_uint {
+        1
+    }
 
     fn scenario(set_updates_var: bool) {
         let mode = if set_updates_var { "TS updates its variable" } else { "TS keeps its variable" };
@@ -621,10 +668,9 @@ mod tests {
         lock(&VARS).clear();
         REMEMBERED.store(0, Ordering::Relaxed);
         SET_UPDATES_VAR.store(set_updates_var, Ordering::Relaxed);
-        lock(&STATE).sch = 1;
 
-        set_volume(5, -7);
-        set_volume(5, -8); // second wheel notch
+        set_volume(1, 5, -7);
+        set_volume(1, 5, -8); // second wheel notch
         assert_eq!(volume(1, 5), -8, "{mode}: talks again");
         assert_eq!(volume(1, 6), 0, "{mode}: other people keep TS's value");
 
@@ -633,9 +679,13 @@ mod tests {
         LAST_SET.store(i32::MIN, Ordering::Relaxed);
         assert_eq!(volume(1, 15), -8, "{mode}: after rejoin");
         assert_eq!(LAST_SET.load(Ordering::Relaxed), -8, "{mode}: re-applied to TS");
+
+        // TS drops ours on its own while they stay: back to its remembered value
+        lock(&VARS).remove(&15);
         LAST_SET.store(i32::MIN, Ordering::Relaxed);
-        assert_eq!(volume(1, 15), -8);
-        assert_eq!(LAST_SET.load(Ordering::Relaxed), i32::MIN, "{mode}: applied only once per clid");
+        assert_eq!(volume(1, 15), -8, "{mode}: after TS dropped it");
+        assert_eq!(LAST_SET.load(Ordering::Relaxed), -8, "{mode}: set again");
+        assert_eq!(load_volumes().get("same+person/uid=").map(|v| v.0), Some(-8), "{mode}: still saved");
 
         // TS restart: only the file is left
         lock(&VARS).clear();
@@ -667,6 +717,7 @@ mod tests {
             get_channel_client_list: fail_list,
             get_current_server_connection_handler_id: sch,
             get_server_connect_info: fail_info,
+            get_server_connection_handler_list: fail_tabs,
         });
         // one test, both modes in turn: they share the plugin's statics
         scenario(true);

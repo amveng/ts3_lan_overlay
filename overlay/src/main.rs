@@ -1,13 +1,13 @@
 //! TS LAN Overlay: two always-on-top click-through overlays fed over the local network by the
 //! `ts3_lan_overlay` TeamSpeak plugin running on another computer.
 //!
-//! "Кто говорит" lists current speakers, whispers on top and channel voice below; a nick
+//! "Кто говорит" lists current speakers of every TS tab, whispers on top and channel voice below; a nick
 //! lingers for a while after the person stops. "Список канала" lists everyone in the channel.
 //! Settings and log live in %APPDATA%\TS LAN Overlay; the tray icon opens settings or exits.
 
 #![windows_subsystem = "windows"]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
@@ -37,15 +37,34 @@ pub struct Speaker {
     pub volume: i32,
 }
 
+/// One connected server tab on the TS computer.
 #[derive(Default)]
-pub struct State {
+pub struct Tab {
+    /// Server address, for the tab's heading in the overlays.
+    pub name: String,
     pub self_id: u16,
     pub channel_id: u64,
     pub speakers: HashMap<u16, Speaker>,
-    /// Everyone in the channel: (clid, nickname).
+    /// Everyone in our channel: (clid, nickname).
     pub channel: Vec<(u16, String)>,
     /// When someone came into our channel, while they are highlighted.
     pub joined: HashMap<u16, Instant>,
+}
+
+#[derive(Default)]
+pub struct State {
+    /// The tab in front in TS; shown first.
+    pub active: u64,
+    /// Every connected tab by its id on the TS computer.
+    pub tabs: BTreeMap<u64, Tab>,
+}
+
+impl State {
+    /// Tabs in display order: the active one first, the rest as TS opened them.
+    pub fn ordered(&self) -> impl Iterator<Item = (u64, &Tab)> {
+        let first = self.tabs.get_key_value(&self.active).map(|(k, t)| (*k, t));
+        first.into_iter().chain(self.tabs.iter().filter(|(k, _)| **k != self.active).map(|(k, t)| (*k, t)))
+    }
 }
 
 pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -71,49 +90,52 @@ pub fn log(msg: &str) {
 fn apply(snap: &Snapshot) {
     let now = Instant::now();
     let mut s = lock(&STATE);
-    if snap.channel.is_empty() {
-        s.speakers.clear(); // left the server
-    }
-    for (id, sp) in s.speakers.iter_mut() {
-        if sp.talking && !snap.talking.iter().any(|t| t.0 == *id) {
-            sp.talking = false;
-            sp.since = now; // starts the linger countdown
-        }
-    }
-    for (id, whisper, volume, name) in &snap.talking {
-        match s.speakers.get_mut(id) {
-            Some(sp) if sp.talking && sp.whisper == *whisper => (sp.name, sp.volume) = (name.clone(), *volume),
-            _ => {
-                let speaker = Speaker { name: name.clone(), talking: true, whisper: *whisper, since: now, volume: *volume };
-                s.speakers.insert(*id, speaker);
+    // tabs closed or disconnected on the TS computer go away with their speakers
+    s.tabs.retain(|id, _| snap.tabs.iter().any(|t| t.id == *id));
+    s.active = snap.tabs.iter().find(|t| t.active).map_or(0, |t| t.id);
+    for st in &snap.tabs {
+        let tab = s.tabs.entry(st.id).or_default();
+        for (id, sp) in tab.speakers.iter_mut() {
+            if sp.talking && !st.talking.iter().any(|t| t.0 == *id) {
+                sp.talking = false;
+                sp.since = now; // starts the linger countdown
             }
         }
-    }
-    // Only people arriving in the channel we already sit in; not everyone on connect or when
-    // we switch channels ourselves.
-    if !s.channel.is_empty() && s.channel_id == snap.channel_id {
-        for (id, _) in &snap.channel {
-            if !s.channel.iter().any(|c| c.0 == *id) {
-                s.joined.insert(*id, now);
+        for (id, whisper, volume, name) in &st.talking {
+            match tab.speakers.get_mut(id) {
+                Some(sp) if sp.talking && sp.whisper == *whisper => (sp.name, sp.volume) = (name.clone(), *volume),
+                _ => {
+                    let speaker = Speaker { name: name.clone(), talking: true, whisper: *whisper, since: now, volume: *volume };
+                    tab.speakers.insert(*id, speaker);
+                }
             }
         }
+        // Only people arriving in the channel we already sit in; not everyone on connect or when
+        // we switch channels ourselves.
+        if !tab.channel.is_empty() && tab.channel_id == st.channel_id {
+            for (id, _) in &st.channel {
+                if !tab.channel.iter().any(|c| c.0 == *id) {
+                    tab.joined.insert(*id, now);
+                }
+            }
+        }
+        tab.joined.retain(|id, _| st.channel.iter().any(|c| c.0 == *id));
+        (tab.name, tab.self_id, tab.channel_id) = (st.name.clone(), st.self_id, st.channel_id);
+        tab.channel = st.channel.clone();
     }
-    s.joined.retain(|id, _| snap.channel.iter().any(|c| c.0 == *id));
-    s.self_id = snap.self_id;
-    s.channel_id = snap.channel_id;
-    s.channel = snap.channel.clone();
 }
 
-/// Asks the TS computer to set its volume for a client; shown here right away.
-/// Called from the overlay thread.
-pub fn set_volume(clid: u16, db: i32) {
+/// Asks the TS computer to set its volume for a client on one of its tabs; shown here right
+/// away. Called from the overlay thread.
+pub fn set_volume(sch: u64, clid: u16, db: i32) {
     let db = db.clamp(VOLUME_RANGE.0, VOLUME_RANGE.1);
     let Some(ip) = *lock(&TS_ADDR) else { return };
-    let sent = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|s| s.send_to(&proto::encode_volume(clid, db), (ip, CONTROL_PORT)));
+    let packet = proto::encode_volume(sch, clid, db);
+    let sent = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|s| s.send_to(&packet, (ip, CONTROL_PORT)));
     if let Err(e) = sent {
         return log(&format!("не удалось отправить громкость на {ip}: {e}"));
     }
-    if let Some(sp) = lock(&STATE).speakers.get_mut(&clid) {
+    if let Some(sp) = lock(&STATE).tabs.get_mut(&sch).and_then(|t| t.speakers.get_mut(&clid)) {
         sp.volume = db;
     }
     overlay::refresh();
@@ -177,19 +199,52 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn tab(id: u64, channel_id: u64, ids: &[u16]) -> proto::Tab {
+        proto::Tab {
+            id,
+            active: id == 1,
+            name: format!("server {id}"),
+            self_id: 1,
+            channel_id,
+            channel: ids.iter().map(|&i| (i, format!("n{i}"))).collect(),
+            talking: vec![],
+        }
+    }
+
     fn snap(channel_id: u64, ids: &[u16]) -> Snapshot {
-        Snapshot { self_id: 1, channel_id, channel: ids.iter().map(|&i| (i, format!("n{i}"))).collect(), talking: vec![] }
+        Snapshot { tabs: vec![tab(1, channel_id, ids)] }
+    }
+
+    fn joined(tab: u64) -> Vec<u16> {
+        lock(&STATE).tabs.get(&tab).map(|t| t.joined.keys().copied().collect()).unwrap_or_default()
     }
 
     #[test]
     fn highlights_only_people_joining_our_channel() {
         apply(&snap(5, &[1, 2])); // connected: nobody highlighted
-        assert!(lock(&STATE).joined.is_empty());
+        assert!(joined(1).is_empty());
         apply(&snap(5, &[1, 2, 3])); // 3 came in
-        assert_eq!(lock(&STATE).joined.keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(joined(1), vec![3]);
         apply(&snap(5, &[1, 2])); // 3 left again
-        assert!(lock(&STATE).joined.is_empty());
+        assert!(joined(1).is_empty());
         apply(&snap(9, &[1, 7, 8])); // we moved to another channel
-        assert!(lock(&STATE).joined.is_empty());
+        assert!(joined(1).is_empty());
+
+        // a second tab opens: its people are not "joining", the same clid there is someone else
+        let mut two = snap(9, &[1, 7, 8]);
+        two.tabs.push(tab(2, 4, &[1, 3]));
+        apply(&two);
+        assert!(joined(2).is_empty());
+        two.tabs[1].channel.push((7, "n7".into()));
+        two.tabs[1].talking.push((7, true, -3, "n7".into()));
+        apply(&two);
+        assert_eq!((joined(1), joined(2)), (vec![], vec![7]));
+        assert!(lock(&STATE).tabs[&2].speakers[&7].whisper);
+        assert!(!lock(&STATE).tabs[&1].speakers.contains_key(&7));
+
+        // the second tab disconnects
+        apply(&snap(9, &[1, 7, 8]));
+        assert_eq!(lock(&STATE).tabs.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(lock(&STATE).active, 1);
     }
 }
